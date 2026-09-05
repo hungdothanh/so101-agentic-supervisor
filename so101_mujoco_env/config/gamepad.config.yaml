@@ -1,0 +1,51 @@
+# SO-101 gamepad joint-space teleop mapping (Phase 3).
+#
+# Axis/button indices are pygame/SDL2 numbering, keyed by pygame's
+# joystick.get_name() -- this varies by OS/driver/pad. "Sony Interactive
+# Entertainment Wireless Controller" below is verified against a real
+# connected PS4/PS5-style pad during development (axes: 0=left_x, 1=left_y,
+# 2=L2 trigger, 3=right_x, 4=right_y, 5=R2 trigger; L2/R2 read -1.0 at rest,
+# +1.0 fully pressed). "default" mirrors that same layout, since it's the
+# common modern SDL2 convention for DualShock-style pads -- if your pad
+# reports differently, run joint_teleop.py --print-only, wiggle each
+# stick/trigger, and fix the indices below to match.
+
+control_rate_hz: 20.0
+max_joint_speed_deg_s: 60.0
+max_gripper_speed_pct_s: 100.0
+deadzone: 0.15
+
+controllers:
+  default:
+    axes: {left_x: 0, left_y: 1, l2: 2, right_x: 3, right_y: 4, r2: 5}
+    buttons: {a: 0, b: 1, x: 2, y: 3, lb: 4, rb: 5}
+    axis_inversion: {left_x: false, left_y: true, right_x: false, right_y: true}
+  "Sony Interactive Entertainment Wireless Controller":
+    # button indices (a/b/x/y) match lerobot's own
+    # examples/tutorial/gym_hil_desk_cleanup/ps4_controller_config.json entry
+    # for this exact device name -- note x/y are swapped from the naive
+    # 0,1,2,3 order, a real quirk of this pad/driver, not a typo.
+    axes: {left_x: 0, left_y: 1, l2: 2, right_x: 3, right_y: 4, r2: 5}
+    buttons: {a: 0, b: 1, x: 3, y: 2, lb: 4, rb: 5}
+    axis_inversion: {left_x: false, left_y: true, right_x: false, right_y: true}
+
+# joint -> named stick axis (from the controller table above) that drives it
+joint_axis_map:
+  shoulder_pan: left_x
+  shoulder_lift: left_y
+  wrist_flex: right_x
+  elbow_flex: right_y
+
+# wrist_roll has no free analog axis left once both sticks are claimed above
+# -- bumper buttons instead (digital, full-speed while held).
+wrist_roll_neg_button: lb
+wrist_roll_pos_button: rb
+
+# Gripper is proportional: gripper_delta = r2_pressed_amount - l2_pressed_amount,
+# each remapped from the trigger's own [-1 (rest), +1 (fully pressed)] range
+# to [0, 1] first. Squeeze R2 to close, L2 to open.
+gripper_close_axis: r2
+gripper_open_axis: l2
+
+# Press (not hold) to reset the episode (env.reset()) without restarting the script.
+reset_button: y

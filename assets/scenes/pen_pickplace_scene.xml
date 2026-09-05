@@ -1,0 +1,202 @@
+<mujoco model="pen_pickplace_scene">
+  <!--
+    Coordinate convention: world origin (0,0,0) = center of the table's
+    short (80cm) edge, at tabletop height. +X runs along the table's 160cm
+    length (away from the arm, into the task space); +Y runs across its
+    80cm width. Tabletop surface is z=0 (so the arm sits flush on it); the
+    table extends down to a floor at z=-1.2 (matching the plan's 120cm
+    table height).
+
+    The arm's own mount point is NOT at this origin -- it's offset to
+    (0, 0.15, 0) via base_link's `pos` in assets/so101/so101.xml (see
+    ARM_MOUNT_POS in scripts/fetch_so101_urdf.py for why it lives there and
+    not as a wrapper element here), moved 15cm along the short edge, away
+    from the front camera, for more separation between the arm and the
+    camera in its own view. All other positions in this file (table, can
+    sampling bounds, bin) are still plain world coordinates, unaffected by
+    that offset -- only the arm's reach envelope shifts with it.
+
+    Phase 0 measured the arm's real horizontal reach at 44.0cm (see
+    assets/so101/so101.xml generation report) -- notably more than
+    PLAN.md's rough 30-35cm guess, which it explicitly flagged as
+    unverified. The can and bin below are placed within that measured
+    44cm radius, not the original guess.
+
+    PEN-VS-CAN DECISION (Phase 2 trigger test): the original pen + pen-box
+    design scored 5% (1/20) on the scripted grasp-trigger test, well under
+    PLAN.md's 80% threshold. Root cause (not a controller bug): SO-101's
+    gripper is a single hook-style finger closing against a fixed palm
+    right at gripper_frame_link -- for a pen lying flush on the table, the
+    palm's own bulk reaches the pen's position before the moving jaw can
+    close on it, just pushing the pen out of the way during descent. This
+    matches PLAN.md's own upfront risk framing (thin objects are much less
+    forgiving for this gripper than a can). Per PLAN.md's decision rule,
+    switched to the can+bin fallback below, reusing
+    lerobot/examples/tutorial/gym_hil_desk_cleanup/desk_cleanup_env.py's
+    two-geom can pattern -- a standing can gives the palm clearance under it
+    that a flush-lying pen never could. Dimensions later shrunk from that
+    verbatim reuse (CAN_RADIUS=0.03, CAN_HALF_HEIGHT=0.06), first to a
+    small/mini cola can (0.026/0.045), then to CAN_RADIUS=0.022,
+    CAN_HALF_HEIGHT=0.038 (~44mm diameter x ~76mm tall), and finally
+    thinned further to CAN_RADIUS=0.019 (~38mm diameter, height
+    unchanged) rather than a standard 330ml can. Bin footprint is shrunk from
+    desk_cleanup's own (half-size 0.09, sized for the Franka's much larger
+    workspace) down to half-size 0.06, to fit SO-101's smaller 44cm reach.
+  -->
+  <include file="../so101/so101.xml"/>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.65 0.75 0.85" rgb2="0.15 0.15 0.2" width="256" height="256"/>
+    <texture name="floor_tex" type="2d" builtin="checker" rgb1="0.22 0.22 0.22" rgb2="0.27 0.27 0.27" width="300" height="300"/>
+    <material name="floor_mat" texture="floor_tex" texrepeat="10 10" reflectance="0.0"/>
+
+    <!-- Realistic can mesh: OpenRobotics's official "Coke Can" Gazebo Fuel
+         model, converted from the earlier so101_sim2real Gazebo project's
+         fetched .dae (Collada -- MuJoCo can't load that format directly)
+         via trimesh, since this Blender install (5.2 LTS) dropped Collada
+         import entirely. Re-centered so the body origin sits at the
+         object's own geometric center (matching this scene's convention:
+         a body's freejoint pos = the object's center height above the
+         table) and exported true-to-scale in meters (real can: 67mm dia x
+         124mm tall -- the DAE's own <unit meter="0.00254" name="inches"/>
+         tag is misleading; the raw coordinates already matched real
+         millimeters almost exactly, not inches, verified by checking
+         against a real can's known size before trusting it). `scale`
+         below shrinks it to this scene's chosen small-can size (38mm dia x
+         76mm tall -- xy shrunk again from an earlier 44mm-dia pass to make
+         the can thinner; z left alone since only the diameter changed) --
+         see assets/objects/coke_can/ for the source conversion notes.
+         MuJoCo does NOT auto-import the OBJ's own MTL/texture reference
+         (verified empirically: ntex/nmat stayed 0 until declared
+         explicitly here). -->
+    <mesh name="coke_can_mesh" file="../objects/coke_can/coke_can.obj" scale="0.567079 0.567079 0.613398"/>
+    <texture name="coke_can_tex" type="2d" file="../objects/coke_can/material_0.png"/>
+    <material name="coke_can_mat" texture="coke_can_tex"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0.3 0 1.6" dir="0 0 -1" diffuse="0.7 0.7 0.7" directional="false"/>
+    <light pos="0.2 -0.6 0.9" dir="0.15 0.5 -0.7" diffuse="0.4 0.4 0.4" directional="false"/>
+
+    <geom name="floor" type="plane" size="3 3 0.1" pos="0 0 -1.2" material="floor_mat"/>
+
+    <!-- table top: 160cm (x) x 80cm (y), 3cm thick, top surface flush at z=0 -->
+    <geom name="table_top" type="box" pos="0.8 0 -0.015" size="0.8 0.4 0.015" rgba="0.92 0.92 0.9 1"/>
+
+    <!-- 4 legs, inset 5cm from each corner, tabletop underside down to the floor -->
+    <geom name="table_leg_1" type="cylinder" pos="0.05 0.35 -0.615" size="0.03 0.6" rgba="0.5 0.5 0.5 1"/>
+    <geom name="table_leg_2" type="cylinder" pos="0.05 -0.35 -0.615" size="0.03 0.6" rgba="0.5 0.5 0.5 1"/>
+    <geom name="table_leg_3" type="cylinder" pos="1.55 0.35 -0.615" size="0.03 0.6" rgba="0.5 0.5 0.5 1"/>
+    <geom name="table_leg_4" type="cylinder" pos="1.55 -0.35 -0.615" size="0.03 0.6" rgba="0.5 0.5 0.5 1"/>
+
+    <!-- fixed front camera: elevated, angled down at the near reachable zone,
+         to avoid the arm's own body occluding the workspace. quat is a
+         look-at rotation targeting (0.30,-0.02,0.02) -- SAME x as the
+         camera's own pos -- computed via a look-at matrix -> mju_mat2Quat.
+         An earlier version targeted a point with a different x (0.27 vs pos
+         x=0.30): technically zero-roll (verified: local "right" axis was
+         exactly horizontal), but that slight sideways yaw made the table's
+         real edges (straight lines parallel to world X) recede at an angle,
+         so ordinary perspective convergence made them look tilted even
+         though the camera itself wasn't rolled. Keeping target x == pos x
+         makes the viewing direction perpendicular to those edges, so they
+         render level. `pos` sits 10cm further out than the original
+         (0.30,-0.40,0.40), along the SAME eye-to-target ray, so the quat
+         (viewing angle) didn't need to change -- only distance did.
+         Regenerate the quat the same way if the target or viewing angle
+         ever changes, keeping pos's x equal to the target's x. -->
+    <camera name="front" pos="0.30 -0.47071068 0.47071068" quat="0.92387953 0.38268343 0 0"/>
+
+    <!-- can: realistic Coca-Cola mesh for looks, primitive cylinder for
+         physics -- decoupling visual detail from collision geometry, the
+         standard fix for exactly the problem hit here: the real scanned
+         mesh's base isn't a perfectly flat disk, so MuJoCo's convex-hull
+         collision on the raw mesh kept toggling between slightly different
+         contact points at rest, a small but persistent jitter (~0.001-0.003
+         m/s, ~0.02-0.07 rad/s, verified never decaying to the ~0.001 at-rest
+         baseline the plain primitive cylinder settled to). The visual mesh
+         geom is contype/conaffinity=0 (never touched by the physics engine
+         at all) and carries negligible mass; the invisible primitive
+         cylinder underneath is what the gripper and table actually contact,
+         identical to the earlier primitive-only can's proven-stable
+         geometry. ~24cm from the arm's mount point. Free joint for
+         per-episode pose randomization (Phase 2). -->
+    <body name="can" pos="0.22 -0.10 0.038">
+      <freejoint/>
+      <geom name="can_visual" type="mesh" mesh="coke_can_mesh" material="coke_can_mat" mass="0.0001"
+            contype="0" conaffinity="0"/>
+      <!-- solref stiffened 4x from MuJoCo's default (0.02 1) -- verified via an
+           isolated pusher-vs-can test (scratch/test_contact_softness.py) that
+           for a brief, moderate overlap (the kind a careful teleop approach
+           that slightly overshoots would cause), this settles the can's
+           post-contact velocity back out roughly 10x faster (final speed
+           ~0.005 vs ~0.03-0.04 m/s). Does NOT fully prevent instability if
+           the gripper is driven persistently through the can for a long
+           span (a targeting/depth-judgment issue, not a contact-softness
+           one -- verified separately that stiffening barely changes that
+           case) -- SO-101 has no force sensing, so avoiding that is a
+           piloting skill (watch the camera feeds), on real hardware too. -->
+      <!-- radius shrunk 0.022 -> 0.019 (thinner can); mass scaled down with it
+           (0.0088 -> 0.0066, proportional to r^2 at constant height) to keep
+           the same density rather than silently making the can artificially
+           denser when it got thinner. -->
+      <geom name="can_collision" type="cylinder" size="0.019 0.038" mass="0.0066" solref="0.005 1"
+            contype="1" conaffinity="1" rgba="0 0 0 0"/>
+    </body>
+
+    <!-- bin: open-top primitive container (bottom + 4 walls), ~34cm from
+         the arm's mount point, fixed to the table. Same floor+4-wall
+         construction as the old pen box (and desk_cleanup's basket), just
+         resized to comfortably hold the can. -->
+    <body name="bin" pos="0.30 0.15 0">
+      <geom name="bin_bottom" type="box" pos="0 0 0.005" size="0.06 0.06 0.005" rgba="0.7 0.4 0.15 1"/>
+      <geom name="bin_wall_pos_x" type="box" pos="0.06 0 0.03" size="0.005 0.06 0.03" rgba="0.7 0.4 0.15 1"/>
+      <geom name="bin_wall_neg_x" type="box" pos="-0.06 0 0.03" size="0.005 0.06 0.03" rgba="0.7 0.4 0.15 1"/>
+      <geom name="bin_wall_pos_y" type="box" pos="0 0.06 0.03" size="0.06 0.005 0.03" rgba="0.7 0.4 0.15 1"/>
+      <geom name="bin_wall_neg_y" type="box" pos="0 -0.06 0.03" size="0.06 0.005 0.03" rgba="0.7 0.4 0.15 1"/>
+    </body>
+  </worldbody>
+
+  <!--
+    "home" keyframe: the first 6 qpos values are the arm's hand-set
+    HOME_QPOS (from scripts/fetch_so101_urdf.py) -- NOT this model's qpos0,
+    which is all-zeros for the arm since no joint sets `ref` (an earlier,
+    reverted design tried baking HOME_QPOS in via `ref`, which turned out to
+    shift what qpos geometrically MEANS rather than just setting a start
+    state -- see so101.xml generation notes). The remaining 7 values (the
+    can's freejoint) DO come verbatim from `model.qpos0` after loading this
+    file, since the can's rest pos/quat has no such `ref` mechanism to
+    conflict with. ctrl matches the arm's HOME_QPOS so the position
+    actuators hold still there instead of driving back toward ctrl=0.
+
+    This is deliberately defined HERE, not in assets/so101/so101.xml, and
+    deliberately sized for this scene's full 13 qpos / 6 ctrl -- an earlier
+    version put a 6-value keyframe in the bare arm asset, and when that got
+    <include>d here, MuJoCo silently padded the missing 7 slots (the
+    manipulated object's freejoint) with ZEROS rather than qpos0's real
+    values. That specific padded keyframe never actually got applied in
+    practice (confirmed by reading mujoco.viewer's source: it never touches
+    keyframes when loading a model by path), but IS a live landmine for
+    anything that does apply it by name (Phase 2's env reset(), or the
+    GUI's own keyframe selector), so it's still fixed here regardless.
+
+    Actually opening this scene: don't use `python -m mujoco.viewer
+    --mjcf=...` -- it always starts from a plain, keyframe-blind
+    mujoco.MjData(model), which for this model means qpos AND ctrl both
+    start at zero (arm folded, not the home pose), and the position
+    actuators immediately start driving hard toward that zero-ctrl target --
+    visible as the arm shaking and swinging away from its spawn pose the
+    instant the viewer opens. Use scripts/view_scene.py instead, which
+    resets to this keyframe (setting qpos and ctrl to match) before
+    launching.
+
+    If you change HOME_QPOS, or the can's default pos/quat in this file,
+    this keyframe goes stale silently (no error, just a wrong reset pose
+    again) -- regenerate the can's 7 values by loading this scene and
+    printing model.qpos0[6:13] (the arm's first 6 values are HOME_QPOS,
+    unaffected by qpos0).
+  -->
+  <keyframe>
+    <key name="home" qpos="0 -1.75 1.62 1.18 0 0 0.22 -0.1 0.038 1 0 0 0" ctrl="0 -1.75 1.62 1.18 0 0"/>
+  </keyframe>
+</mujoco>

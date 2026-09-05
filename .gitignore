@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Training / recording outputs -- if you ever run lerobot-train or record
+# datasets with a local --root/--output_dir inside this repo instead of the
+# default ~/.cache/huggingface/lerobot, they'd land here.
+outputs/
+wandb/
+
+# MuJoCo's own runtime warning log (regenerated every run, not project content)
+MUJOCO_LOG.TXT
+
+# Secrets -- this project calls out to OpenAI (GPT-4o) via langchain-openai,
+# so an API key lives in the environment somewhere. Never let it land in git.
+.env
+.env.*
+*.key
+
+# Editor / tool-local config -- machine-specific, not meant to be shared.
+# .vscode/ here in particular can contain a >1GB IntelliSense cache
+# (browse.vc.db) and absolute paths to unrelated local workspaces.
+.vscode/
+.claude/settings.local.json
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Virtual environments, if you ever create one inside the repo
+.venv/
+venv/
+env/

@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# MUST be underscored, not hyphenated: lerobot's register_third_party_plugins()
+# does a literal `importlib.import_module(dist.metadata["Name"])`, and a
+# hyphenated distribution name would not be a valid dotted module path, so
+# plugin auto-discovery would silently fail to import this package. Same
+# constraint documented in the earlier so101_sim2real project's
+# lerobot_robot_so101_gazebo/pyproject.toml.
+name = "lerobot_robot_so101_mujoco"
+version = "0.1.0"
+description = "LeRobot Robot/Teleoperator pair for the in-process SO-101 MuJoCo digital twin (so101_mujoco_sim2real)"
+requires-python = ">=3.10"
+dependencies = [
+    "mujoco>=3.0",
+    "numpy",
+    "pygame",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_robot_so101_mujoco*"]
