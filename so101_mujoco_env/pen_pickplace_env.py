@@ -60,7 +60,24 @@ MAX_GRIPPER_SPEED_RAD_S = np.deg2rad(120.0)
 CAN_SAMPLING_XY_LOW = np.array([0.16, -0.18])
 CAN_SAMPLING_XY_HIGH = np.array([0.26, -0.02])
 CAN_HALF_HEIGHT = 0.038  # small cola can (~38mm diameter x ~76mm tall), not desk_cleanup's 330ml-can size
+CAN_RADIUS = 0.019  # assets/scenes/pen_pickplace_scene.xml can_collision geom: size="0.019 0.038"
+                     # (radius, half-length) -- the resting z when lying on its side, NOT CAN_HALF_HEIGHT
 CAN_UPRIGHT_QUAT = np.array([1.0, 0.0, 0.0, 0.0])
+
+
+def _sample_fallen_quat(rng: np.random.RandomState) -> np.ndarray:
+    """A quat for the can lying on its side: tip 90deg about the local X axis (long
+    axis goes from vertical to horizontal), then compose a random world-Z yaw so the
+    fallen heading varies -- matches this project's existing quaternion-construction
+    convention (mujoco.mju_euler2Quat/mju_mat2Quat, see scripts/fetch_so101_urdf.py)
+    rather than pulling in a new quaternion-math dependency."""
+    tilt_quat = np.zeros(4)
+    mujoco.mju_euler2Quat(tilt_quat, np.array([np.pi / 2, 0.0, 0.0]), "XYZ")
+    yaw_quat = np.zeros(4)
+    mujoco.mju_euler2Quat(yaw_quat, np.array([0.0, 0.0, rng.uniform(-np.pi, np.pi)]), "XYZ")
+    fallen_quat = np.zeros(4)
+    mujoco.mju_mulQuat(fallen_quat, yaw_quat, tilt_quat)
+    return fallen_quat
 
 BIN_CENTER_XY = np.array([0.30, 0.15])
 # Bin: half-size (0.06, 0.06), wall thickness 0.005 -- see
@@ -151,23 +168,32 @@ class SO101PenPickPlaceEnv(gym.Env):
         drawing a random one -- used by scripts/mimicgen_augment.py to replay/verify a
         candidate demonstration at a specific target position. Falls back to the normal
         random-draw behavior (or no repositioning at all, if randomize_can_pose=False)
-        when omitted, so this is fully backward compatible with every existing caller."""
+        when omitted, so this is fully backward compatible with every existing caller.
+
+        `options={"fallen": True}` (composable with `can_xy`, or with the random-draw
+        path) spawns the can lying on its side instead of standing -- for triggering/
+        testing the supervisor's failure-recovery path on demand (see PLAN.md). Changes
+        only orientation/resting z; position selection is unaffected."""
         super().reset(seed=seed)
         if seed is not None:
             self._np_random = np.random.RandomState(seed)
 
         mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key_id)
 
+        fallen = bool(options.get("fallen", False)) if options else False
+        z = CAN_RADIUS if fallen else CAN_HALF_HEIGHT
+        quat = _sample_fallen_quat(self._np_random) if fallen else CAN_UPRIGHT_QUAT
+
         if options and "can_xy" in options:
             xy = np.asarray(options["can_xy"], dtype=float)
             addr = self._can_qpos_addr
-            self.data.qpos[addr : addr + 3] = (*xy, CAN_HALF_HEIGHT)
-            self.data.qpos[addr + 3 : addr + 7] = CAN_UPRIGHT_QUAT
+            self.data.qpos[addr : addr + 3] = (*xy, z)
+            self.data.qpos[addr + 3 : addr + 7] = quat
         elif self.randomize_can_pose:
             xy = self._np_random.uniform(CAN_SAMPLING_XY_LOW, CAN_SAMPLING_XY_HIGH)
             addr = self._can_qpos_addr
-            self.data.qpos[addr : addr + 3] = (*xy, CAN_HALF_HEIGHT)
-            self.data.qpos[addr + 3 : addr + 7] = CAN_UPRIGHT_QUAT
+            self.data.qpos[addr : addr + 3] = (*xy, z)
+            self.data.qpos[addr + 3 : addr + 7] = quat
 
         mujoco.mj_forward(self.model, self.data)
         return self._get_obs(), {}

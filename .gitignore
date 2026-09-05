@@ -19,6 +19,7 @@ MUJOCO_LOG.TXT
 # so an API key lives in the environment somewhere. Never let it land in git.
 .env
 .env.*
+!.env.example
 *.key
 
 # Editor / tool-local config -- machine-specific, not meant to be shared.
