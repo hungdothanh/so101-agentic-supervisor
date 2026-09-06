@@ -43,11 +43,20 @@ from so101_mujoco_env.pen_pickplace_env import (  # noqa: E402
     CAN_SAMPLING_XY_HIGH,
     CAN_SAMPLING_XY_LOW,
     SO101PenPickPlaceEnv,
+    wrap_heading_delta,
 )
 
 AUG_REPO_ID = "hungdo2401/so101_mimicgen_aug"
 COMBINED_REPO_ID = "hungdo2401/so101_baseline_plus_mimicgen"
 BASELINE_REPO_ID = "hungdo2401/so101_baseline"
+
+# meters/radian -- converts a heading mismatch into a position-mismatch-equivalent
+# term for nearest_reference()'s combined distance (see that function). Placeholder:
+# no real fallen-can reference data exists yet to measure the actual approach-path
+# extent this should scale to -- recalibrate once real references exist, same as
+# this project's established practice of tuning constants against real data rather
+# than guessing once (see GRIPPER_OPEN_THRESHOLD's own calibration note below).
+HEADING_WEIGHT = 0.08
 
 SINGLE_TASK = "pick up the can and place it in the bin"  # matches so101_baseline's own tasks.parquet exactly
 RENDER_SIZE = (480, 480)  # matches so101_baseline's recorded resolution (SO101MujocoConfig.camera_shapes)
@@ -71,7 +80,7 @@ GRASP_HOLD_TICKS = 25  # matches grasp_trigger_test.py's GRASP_HOLD_STEPS -- the
 LIFT_Z = 0.15  # matches grasp_trigger_test.py's LIFT_Z -- see generate_candidate()'s lift phase
 
 REFS_REPO_ID = "hungdo2401/so101_mimicgen_refs"
-REFS_POSE_LOG = _PROJECT_ROOT / "mimicgen_ref_poses.json"
+REFS_POSE_LOG = _PROJECT_ROOT / "data" / "mimicgen_ref_poses.json"
 
 # Duplicated from lerobot_bridge/.../so101_mujoco.py -- same convention (0% =
 # joint's min angle = CLOSED, 100% = max angle = OPEN).
@@ -109,20 +118,38 @@ def action_to_env_delta(action_deg_pct: np.ndarray, qpos_rad: np.ndarray, env: S
     return delta
 
 
-def load_reference_poses() -> dict[int, np.ndarray]:
-    if not REFS_POSE_LOG.exists():
+def load_reference_poses(pose_log_path: Path = REFS_POSE_LOG) -> dict[int, dict]:
+    """Each logged pose is `[x, y]` (standing-can references, today's existing format)
+    or `[x, y, heading]` (fallen-can references, logged by record_dataset.py --fallen).
+    Returns {"can_xy": ndarray, "can_heading": float | None} per episode -- `None`
+    for the 2-element format, so downstream code (nearest_reference/generate_candidate)
+    falls back to today's position-only behavior exactly when it's absent."""
+    if not pose_log_path.exists():
         raise FileNotFoundError(
-            f"{REFS_POSE_LOG} not found -- expected the JSON produced by "
+            f"{pose_log_path} not found -- expected the JSON produced by "
             f"record_dataset.py --can-xy-log-path when the reference episodes were recorded."
         )
-    with open(REFS_POSE_LOG) as f:
+    with open(pose_log_path) as f:
         raw = json.load(f)
-    return {int(k): np.asarray(v, dtype=float) for k, v in raw.items()}
+    poses = {}
+    for k, v in raw.items():
+        arr = np.asarray(v, dtype=float)
+        poses[int(k)] = {"can_xy": arr[:2], "can_heading": float(arr[2]) if arr.shape[0] >= 3 else None}
+    return poses
 
 
-def replay_episode(dataset, episode_idx: int, can_xy: np.ndarray, env: SO101PenPickPlaceEnv) -> dict:
+def replay_episode(
+    dataset,
+    episode_idx: int,
+    can_xy: np.ndarray,
+    env: SO101PenPickPlaceEnv,
+    *,
+    fallen: bool = False,
+    can_heading: float | None = None,
+) -> dict:
     """Replay one recorded episode's actions through real physics, starting the can
-    at its logged position. Returns success flag + two reconstructed Cartesian
+    at its logged position (and, for a fallen-can reference, its logged heading --
+    see `fallen`/`can_heading`). Returns success flag + two reconstructed Cartesian
     fingertip trajectories (one point per tick): 'fingertip_path', evaluated at the
     CURRENT gripper opening, for display/segmentation only (shows the fingertip's
     actual path, gripper motion included); and 'fingertip_closed_path', evaluated
@@ -138,7 +165,12 @@ def replay_episode(dataset, episode_idx: int, can_xy: np.ndarray, env: SO101PenP
     row = dataset.meta.episodes[episode_idx]
     start, end = row["dataset_from_index"], row["dataset_to_index"]
 
-    obs, _ = env.reset(options={"can_xy": can_xy})
+    reset_options = {"can_xy": can_xy}
+    if fallen:
+        reset_options["fallen"] = True
+        if can_heading is not None:
+            reset_options["can_heading"] = can_heading
+    obs, _ = env.reset(options=reset_options)
     qpos_rad = obs["agent_pos"][: len(ARM_JOINTS)]
     gripper_closed_qpos = env._ctrlrange["gripper"][0]
 
@@ -146,6 +178,7 @@ def replay_episode(dataset, episode_idx: int, can_xy: np.ndarray, env: SO101PenP
     fingertip_path = []
     fingertip_closed_path = []
     wrist_roll_path = []
+    position_joints_path = []
     gripper_pct_path = []
     for i in range(start, end):
         action_deg_pct = dataset[i]["action"].numpy()
@@ -157,6 +190,7 @@ def replay_episode(dataset, episode_idx: int, can_xy: np.ndarray, env: SO101PenP
         fingertip_path.append(fingertip_at(env, gripper_rad))
         fingertip_closed_path.append(fingertip_at(env, gripper_closed_qpos))
         wrist_roll_path.append(float(qpos_rad[4]))  # ARM_JOINTS[4] == "wrist_roll"
+        position_joints_path.append(qpos_rad[:4].copy())  # ARM_JOINTS[:4] == ik_utils.POSITION_JOINTS
         gripper_pct_path.append(float(action_deg_pct[5]))
 
         if info["succeed"]:
@@ -167,11 +201,13 @@ def replay_episode(dataset, episode_idx: int, can_xy: np.ndarray, env: SO101PenP
     return {
         "episode_idx": episode_idx,
         "can_xy": can_xy,
+        "can_heading": can_heading,
         "success": success,
         "n_ticks": len(fingertip_path),
         "fingertip_path": np.array(fingertip_path),
         "fingertip_closed_path": np.array(fingertip_closed_path),
         "wrist_roll_path": np.array(wrist_roll_path),
+        "position_joints_path": np.array(position_joints_path),
         "gripper_pct_path": np.array(gripper_pct_path),
     }
 
@@ -263,22 +299,31 @@ def extract_waypoints(seg: dict, n_transport: int = 4, n_place: int = 3) -> dict
     frame (see replay_episode()'s docstring).
 
     Also returns 'approach_wrist_roll', the human's own recorded wrist_roll angle
-    over the same span: FingertipIK's 4-DOF IK is redundant for a 3D position
-    target and never controls wrist_roll at all, so it can converge to a
-    different arm configuration (different roll) than the human used even while
-    matching the fingertip point exactly -- for this single-jaw-against-fixed-palm
-    gripper, the wrong roll means the can just isn't between the pincers when the
-    jaw closes. Verified directly: even with 'fingertip_closed_path' wired in, the
-    gripper closed fully (no stall on contact) and the can toppled rather than
-    lifted. Replaying the recorded roll needs no retargeting since a pure XY
-    translation of an axially-symmetric can doesn't change the needed approach
-    orientation."""
+    over the same span, and 'approach_q_ref', the human's own recorded 4-joint
+    POSITION_JOINTS configuration over the same span: FingertipIK's 4-DOF IK is
+    redundant for a 3D position target (one spare DOF) and by default has no
+    preference for which of the many valid configurations it converges to, so it
+    can end up with a different arm configuration (different roll, or a different
+    elbow/shoulder trade-off among the position joints themselves) than the human
+    used even while matching the fingertip point exactly -- for this
+    single-jaw-against-fixed-palm gripper, the wrong configuration means the can
+    just isn't between the pincers when the jaw closes. Verified directly: even
+    with 'fingertip_closed_path' wired in, the gripper closed fully (no stall on
+    contact) and the can toppled rather than lifted. wrist_roll is fixed by
+    replaying it directly (bypassing IK for that one joint, needs no retargeting
+    since a pure XY translation of an axially-symmetric can doesn't change the
+    needed approach orientation); 'approach_q_ref' extends the same fix to the
+    other 4 joints via generate_candidate()'s null-space IK bias (see
+    ik_utils.py's FingertipIK.position_action()), since those joints ARE the IK's
+    own job and can't be bypassed the same direct-replay way."""
     fp = seg["fingertip_closed_path"]
     wr = seg["wrist_roll_path"]
+    pj = seg["position_joints_path"]
     t_open, t_grasp, t_release, n = seg["t_open"], seg["t_grasp"], seg["t_release"], seg["n_ticks"]
 
     approach_path = [fp[i].copy() for i in range(t_open, t_grasp + 1)]
     approach_wrist_roll = [float(wr[i]) for i in range(t_open, t_grasp + 1)]
+    approach_q_ref = [pj[i].copy() for i in range(t_open, t_grasp + 1)]
 
     transport_idx = _sample_indices(t_grasp, t_release, n_transport)
     place_idx = _sample_indices(t_release, n - 1, n_place)
@@ -288,15 +333,30 @@ def extract_waypoints(seg: dict, n_transport: int = 4, n_place: int = 3) -> dict
     return {
         "approach_path": approach_path,
         "approach_wrist_roll": approach_wrist_roll,
+        "approach_q_ref": approach_q_ref,
         "transport_place": transport_wps + place_wps,
     }
 
 
-def nearest_reference(target_xy: np.ndarray, references: dict[int, dict]) -> int:
-    """Which reference episode's own can position is closest to target_xy --
-    minimizes the translation distance, reducing IK-extrapolation/reachability
-    risk per the plan."""
-    dists = {ep: np.linalg.norm(np.asarray(seg["can_xy"]) - target_xy) for ep, seg in references.items()}
+def nearest_reference(
+    target_xy: np.ndarray, references: dict[int, dict], target_heading: float | None = None
+) -> int:
+    """Which reference episode is closest to (target_xy, target_heading) -- minimizes
+    position distance plus, when both the target and a given reference carry a
+    heading, a heading-mismatch term (HEADING_WEIGHT * wrapped angular distance)
+    converted to the same position-mismatch-equivalent units. Falls back to pure
+    position distance (today's exact behavior) whenever `target_heading` is None or
+    a given reference has none logged (`can_heading` is None) -- the axially-
+    symmetric standing-can case is unaffected."""
+
+    def dist(seg: dict) -> float:
+        d = float(np.linalg.norm(np.asarray(seg["can_xy"]) - target_xy))
+        ref_heading = seg.get("can_heading")
+        if target_heading is not None and ref_heading is not None:
+            d += HEADING_WEIGHT * abs(wrap_heading_delta(target_heading - ref_heading))
+        return d
+
+    dists = {ep: dist(seg) for ep, seg in references.items()}
     return min(dists, key=dists.get)
 
 
@@ -306,8 +366,9 @@ def _compute_action(
     target: np.ndarray,
     gripper_action: float,
     wrist_roll_target: float | None = None,
+    q_ref: np.ndarray | None = None,
 ) -> tuple[np.ndarray, float]:
-    pos_actions, err = ik.position_action(target)
+    pos_actions, err = ik.position_action(target, q_ref=q_ref)
     action = np.zeros(len(ARM_JOINTS), dtype=np.float32)
     for i, joint in enumerate(ARM_JOINTS):
         if joint in pos_actions:
@@ -390,10 +451,11 @@ def _drive_one_tick(
     target: np.ndarray,
     gripper_action: float,
     wrist_roll_target: float | None = None,
+    q_ref: np.ndarray | None = None,
     obs: dict | None = None,
     frames: list | None = None,
 ) -> tuple[dict, float, bool, bool]:
-    action, err = _compute_action(env, ik, target, gripper_action, wrist_roll_target)
+    action, err = _compute_action(env, ik, target, gripper_action, wrist_roll_target, q_ref=q_ref)
     new_obs, _reward, _term, truncated, info = env.step(action)
     if frames is not None and obs is not None:
         frames.append(_build_frame(obs, env))
@@ -405,22 +467,44 @@ def generate_candidate(
     references: dict[int, dict],
     env: SO101PenPickPlaceEnv,
     record: bool = False,
+    target_heading: float | None = None,
 ) -> dict:
     """Reset the env with the can at target_xy, retarget the nearest reference's
-    approach path by translation, and run four phases: (1) dense per-tick
-    tracking along the translated approach path, gripper open -- reproduces the
-    human's own collision-avoiding motion shape, see extract_waypoints(); (2) a
-    fixed grasp-hold at the final approach point, gripper closed, giving the
-    finite-rate gripper time to actually close on the can (matches
-    grasp_trigger_test.py's GRASP_HOLD_STEPS); (3) an explicit straight-up lift
-    (self-canceling XY, matching grasp_trigger_test.py's own "lift" phase) before
-    (4) the sparse, bin-relative transport/place waypoints, used as-is (skipping
-    their first entry, which duplicates the grasp point). The lift is needed for
-    the same reason the approach got a hover-then-descend split: transport_place's
-    first two waypoints jump from grasp height straight to a high point ~20-25cm
-    away in one combined XY+Z move, which knocked/launched the can in dev
-    testing (verified directly) -- separating "straight up" from "move to bin"
-    avoids it.
+    approach path, and run four phases: (1) dense per-tick tracking along the
+    retargeted approach path, gripper open -- reproduces the human's own
+    collision-avoiding motion shape, see extract_waypoints(); (2) a fixed grasp-hold
+    at the final approach point, gripper closed, giving the finite-rate gripper time
+    to actually close on the can (matches grasp_trigger_test.py's GRASP_HOLD_STEPS);
+    (3) an explicit straight-up lift (self-canceling XY, matching
+    grasp_trigger_test.py's own "lift" phase) before (4) the sparse, bin-relative
+    transport/place waypoints, used as-is (skipping their first entry, which
+    duplicates the grasp point). The lift is needed for the same reason the approach
+    got a hover-then-descend split: transport_place's first two waypoints jump from
+    grasp height straight to a high point ~20-25cm away in one combined XY+Z move,
+    which knocked/launched the can in dev testing (verified directly) -- separating
+    "straight up" from "move to bin" avoids it.
+
+    RETARGETING: `target_heading=None` (the standing-can case, and generate_candidate's
+    exact prior behavior): pure XY translation of every approach-path point by
+    `target_xy - reference_can_xy`, wrist_roll replayed unchanged -- valid because an
+    axially-symmetric can looks identical from any heading. `target_heading=<float>`
+    (fallen-can case): the nearest reference is chosen with heading in mind (see
+    nearest_reference()), and each approach-path point's offset FROM THE REFERENCE'S
+    OWN CAN POSITION is additionally rotated by the wrapped heading delta between the
+    reference and the target before being placed at target_xy -- a pure translation
+    would keep the approach path's shape fixed in its original compass direction
+    regardless of the target's actual heading, which is wrong for a non-symmetric
+    fallen can (see this project's own single-jaw-against-fixed-palm gripper design,
+    documented in ik_utils.py, which needs the approach to line up with the can's
+    actual orientation). `approach_wrist_roll` is shifted by that same delta.
+    `transport_place` is untouched in both cases -- bin-relative, independent of
+    where the grasp happened (true for both the standing and fallen case). When
+    `target_heading` is None or the chosen reference has no logged heading, `dtheta`
+    is exactly 0 and this reduces to the original translation-only behavior.
+    UNVERIFIED ASSUMPTION (no real fallen-can reference data exists yet): that
+    shifting wrist_roll by the same `dtheta` as the position rotation is the correct
+    way to track a rotated can -- flagged to check once real references exist, the
+    same way the standing-case retargeting needed real debugging before it worked.
 
     `record=False` (default): no rendering, cheap dry-run verification pass.
     `record=True`: also returns 'frames', a list of LeRobotDataset-ready frame
@@ -429,17 +513,41 @@ def generate_candidate(
     identical target_xy/references/deterministic physics through this same
     function on an image_obs=True env reproduces the exact winning trajectory
     found during the dry run."""
-    ref_ep = nearest_reference(target_xy, references)
+    ref_ep = nearest_reference(target_xy, references, target_heading)
     seg = references[ref_ep]
     wps = extract_waypoints(seg)
 
-    dx_dy = target_xy - np.asarray(seg["can_xy"])
-    offset = np.array([dx_dy[0], dx_dy[1], 0.0])
-    translated_approach = [p + offset for p in wps["approach_path"]]
-    approach_wrist_roll = wps["approach_wrist_roll"]
+    ref_xy = np.asarray(seg["can_xy"])
+    ref_heading = seg.get("can_heading")
+    dtheta = wrap_heading_delta(target_heading - ref_heading) if (target_heading is not None and ref_heading is not None) else 0.0
+    cos_dt, sin_dt = np.cos(dtheta), np.sin(dtheta)
+
+    def retarget_xy(p_xy: np.ndarray) -> np.ndarray:
+        rel = p_xy - ref_xy
+        rotated = np.array([cos_dt * rel[0] - sin_dt * rel[1], sin_dt * rel[0] + cos_dt * rel[1]])
+        return target_xy + rotated
+
+    translated_approach = [np.array([*retarget_xy(p[:2]), p[2]]) for p in wps["approach_path"]]
+    approach_wrist_roll = [wr + dtheta for wr in wps["approach_wrist_roll"]]
     grasp_wrist_roll = approach_wrist_roll[-1]
 
-    obs, _ = env.reset(options={"can_xy": target_xy})
+    # Null-space IK bias toward the reference's own recorded arm configuration --
+    # fallen-can path only (gated on target_heading), see ik_utils.py's
+    # FingertipIK.position_action() docstring for why. None on the standing-can
+    # path keeps that already-working retargeting bit-for-bit unchanged.
+    approach_q_ref: list[np.ndarray | None]
+    if target_heading is not None:
+        approach_q_ref = list(wps["approach_q_ref"])
+        grasp_q_ref = approach_q_ref[-1]
+    else:
+        approach_q_ref = [None] * len(translated_approach)
+        grasp_q_ref = None
+
+    reset_options = {"can_xy": target_xy}
+    if target_heading is not None:
+        reset_options["fallen"] = True
+        reset_options["can_heading"] = target_heading
+    obs, _ = env.reset(options=reset_options)
     ik = FingertipIK(env)
 
     frames: list | None = [] if record else None
@@ -447,9 +555,9 @@ def generate_candidate(
     success = False
     truncated = False
 
-    for target, wr_target in zip(translated_approach, approach_wrist_roll):
+    for target, wr_target, q_ref_tick in zip(translated_approach, approach_wrist_roll, approach_q_ref):
         obs, _err, success, truncated = _drive_one_tick(
-            env, ik, target, GRIPPER_OPEN_ACTION, wrist_roll_target=wr_target, obs=obs, frames=frames
+            env, ik, target, GRIPPER_OPEN_ACTION, wrist_roll_target=wr_target, q_ref=q_ref_tick, obs=obs, frames=frames
         )
         total_ticks += 1
         if success or truncated:
@@ -459,7 +567,7 @@ def generate_candidate(
         grasp_target = translated_approach[-1]
         for _ in range(GRASP_HOLD_TICKS):
             obs, _err, success, truncated = _drive_one_tick(
-                env, ik, grasp_target, GRIPPER_CLOSE_ACTION, wrist_roll_target=grasp_wrist_roll, obs=obs, frames=frames
+                env, ik, grasp_target, GRIPPER_CLOSE_ACTION, wrist_roll_target=grasp_wrist_roll, q_ref=grasp_q_ref, obs=obs, frames=frames
             )
             total_ticks += 1
             if success or truncated:
@@ -470,7 +578,7 @@ def generate_candidate(
         lift_target = np.array([lift_xy[0], lift_xy[1], LIFT_Z])
         for _ in range(MAX_STEPS_PER_WAYPOINT):
             obs, err, success, truncated = _drive_one_tick(
-                env, ik, lift_target, GRIPPER_CLOSE_ACTION, wrist_roll_target=grasp_wrist_roll, obs=obs, frames=frames
+                env, ik, lift_target, GRIPPER_CLOSE_ACTION, wrist_roll_target=grasp_wrist_roll, q_ref=grasp_q_ref, obs=obs, frames=frames
             )
             total_ticks += 1
             if success or truncated or err < DIST_THRESHOLD:
@@ -484,7 +592,9 @@ def generate_candidate(
 
     result = {
         "target_xy": target_xy,
+        "target_heading": target_heading,
         "ref_episode": ref_ep,
+        "dtheta_deg": np.degrees(dtheta),
         "success": success,
         "ticks": total_ticks,
     }
@@ -493,17 +603,22 @@ def generate_candidate(
     return result
 
 
-def load_segmented_references(env: SO101PenPickPlaceEnv) -> dict[int, dict]:
+def load_segmented_references(
+    env: SO101PenPickPlaceEnv,
+    refs_repo_id: str = REFS_REPO_ID,
+    refs_pose_log: Path = REFS_POSE_LOG,
+    fallen: bool = False,
+) -> dict[int, dict]:
     """Replay + segment every reference episode, keyed by episode index. Raises if
     any reference fails verification or segmentation -- generation should never
     proceed on top of an unverified/unsegmentable reference."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    poses = load_reference_poses()
-    dataset = LeRobotDataset(REFS_REPO_ID)
+    poses = load_reference_poses(refs_pose_log)
+    dataset = LeRobotDataset(refs_repo_id)
     references = {}
-    for ep, can_xy in poses.items():
-        result = replay_episode(dataset, ep, can_xy, env)
+    for ep, pose in poses.items():
+        result = replay_episode(dataset, ep, pose["can_xy"], env, fallen=fallen, can_heading=pose["can_heading"])
         if not result["success"]:
             raise RuntimeError(f"reference episode {ep} failed physics-replay verification -- fix before generating")
         seg = segment_episode(result)
@@ -513,22 +628,33 @@ def load_segmented_references(env: SO101PenPickPlaceEnv) -> dict[int, dict]:
     return references
 
 
+def _sample_candidates(args: argparse.Namespace) -> list[tuple[np.ndarray, float | None]]:
+    """(target_xy, target_heading) per candidate -- heading is sampled uniformly over
+    [0, pi) (see heading_from_quat()'s own mod-pi rationale) when --fallen, else None
+    for every candidate (today's position-only standing-can behavior)."""
+    rng = np.random.RandomState(args.seed)
+    xys = rng.uniform(CAN_SAMPLING_XY_LOW, CAN_SAMPLING_XY_HIGH, size=(args.n_candidates, 2))
+    if args.fallen:
+        headings = rng.uniform(0.0, np.pi, size=args.n_candidates)
+        return list(zip(xys, headings))
+    return [(xy, None) for xy in xys]
+
+
 def cmd_generate(args: argparse.Namespace) -> None:
     env = SO101PenPickPlaceEnv(control_dt=0.05, randomize_can_pose=False)
-    references = load_segmented_references(env)
+    references = load_segmented_references(env, args.refs_repo_id, args.refs_pose_log, args.fallen)
     print(f"Loaded {len(references)} verified, segmented references.")
 
-    rng = np.random.RandomState(args.seed)
-    candidates = rng.uniform(CAN_SAMPLING_XY_LOW, CAN_SAMPLING_XY_HIGH, size=(args.n_candidates, 2))
+    candidates = _sample_candidates(args)
 
     import time
 
     t0 = time.perf_counter()
     results = []
-    for i, target_xy in enumerate(candidates):
-        r = generate_candidate(target_xy, references, env)
+    for i, (target_xy, target_heading) in enumerate(candidates):
+        r = generate_candidate(target_xy, references, env, target_heading=target_heading)
         results.append(r)
-        print(f"candidate {i + 1}/{len(candidates)}: target={np.round(target_xy, 3)} ref_ep={r['ref_episode']} -> {'SUCCESS' if r['success'] else 'fail'} ({r['ticks']} ticks)")
+        print(f"candidate {i + 1}/{len(candidates)}: target={np.round(target_xy, 3)} heading={target_heading} ref_ep={r['ref_episode']} dtheta={r['dtheta_deg']:.1f}deg -> {'SUCCESS' if r['success'] else 'fail'} ({r['ticks']} ticks)")
     elapsed = time.perf_counter() - t0
 
     n_ok = sum(r["success"] for r in results)
@@ -555,20 +681,19 @@ def cmd_build_dataset(args: argparse.Namespace) -> None:
     from lerobot.utils.constants import HF_LEROBOT_HOME
 
     dry_env = SO101PenPickPlaceEnv(control_dt=0.05, randomize_can_pose=False)
-    references = load_segmented_references(dry_env)
+    references = load_segmented_references(dry_env, args.refs_repo_id, args.refs_pose_log, args.fallen)
     print(f"Loaded {len(references)} verified, segmented references.")
 
-    rng = np.random.RandomState(args.seed)
-    candidates = rng.uniform(CAN_SAMPLING_XY_LOW, CAN_SAMPLING_XY_HIGH, size=(args.n_candidates, 2))
+    candidates = _sample_candidates(args)
 
     t0 = time.perf_counter()
     accepted = []
-    for i, target_xy in enumerate(candidates):
-        r = generate_candidate(target_xy, references, dry_env)
+    for i, (target_xy, target_heading) in enumerate(candidates):
+        r = generate_candidate(target_xy, references, dry_env, target_heading=target_heading)
         status = "accept" if r["success"] else "reject"
-        print(f"dry-run {i + 1}/{len(candidates)}: target={np.round(target_xy, 3)} ref_ep={r['ref_episode']} -> {status} ({r['ticks']} ticks)")
+        print(f"dry-run {i + 1}/{len(candidates)}: target={np.round(target_xy, 3)} heading={target_heading} ref_ep={r['ref_episode']} dtheta={r['dtheta_deg']:.1f}deg -> {status} ({r['ticks']} ticks)")
         if r["success"]:
-            accepted.append(target_xy)
+            accepted.append((target_xy, target_heading))
         if args.max_episodes and len(accepted) >= args.max_episodes:
             break
     dry_env.close()
@@ -598,8 +723,8 @@ def cmd_build_dataset(args: argparse.Namespace) -> None:
     n_written = 0
     t0 = time.perf_counter()
     try:
-        for i, target_xy in enumerate(accepted):
-            r = generate_candidate(target_xy, references, render_env, record=True)
+        for i, (target_xy, target_heading) in enumerate(accepted):
+            r = generate_candidate(target_xy, references, render_env, record=True, target_heading=target_heading)
             if not r["success"]:
                 print(f"episode {i}: re-render mismatch (accepted on dry run, failed on record pass) -- skipping")
                 continue
@@ -652,22 +777,22 @@ def cmd_combine(args: argparse.Namespace) -> None:
 def cmd_segment_refs(args: argparse.Namespace) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    poses = load_reference_poses()
-    dataset = LeRobotDataset(REFS_REPO_ID)
+    poses = load_reference_poses(args.refs_pose_log)
+    dataset = LeRobotDataset(args.refs_repo_id)
     env = SO101PenPickPlaceEnv(control_dt=0.05, randomize_can_pose=False)
 
-    for ep, can_xy in poses.items():
-        result = replay_episode(dataset, ep, can_xy, env)
+    for ep, pose in poses.items():
+        result = replay_episode(dataset, ep, pose["can_xy"], env, fallen=args.fallen, can_heading=pose["can_heading"])
         seg = segment_episode(result)
         n = seg["n_ticks"]
         if not seg["segmented_ok"]:
-            print(f"episode {ep}: can_xy={can_xy} -> SEGMENTATION FAILED (t_open={seg['t_open']}, t_grasp={seg['t_grasp']}, t_release={seg['t_release']}, n_ticks={n})")
+            print(f"episode {ep}: pose={pose} -> SEGMENTATION FAILED (t_open={seg['t_open']}, t_grasp={seg['t_grasp']}, t_release={seg['t_release']}, n_ticks={n})")
             continue
         t_open, t_grasp, t_release = seg["t_open"], seg["t_grasp"], seg["t_release"]
         grasp_pos = seg["fingertip_path"][t_grasp]
         release_pos = seg["fingertip_path"][t_release]
         print(
-            f"episode {ep}: can_xy={can_xy} -> home=[0,{t_open}) approach=[{t_open},{t_grasp}) "
+            f"episode {ep}: pose={pose} -> home=[0,{t_open}) approach=[{t_open},{t_grasp}) "
             f"transport=[{t_grasp},{t_release}) place=[{t_release},{n}) | "
             f"fingertip@grasp={np.round(grasp_pos, 3)} fingertip@release={np.round(release_pos, 3)}"
         )
@@ -678,8 +803,8 @@ def cmd_segment_refs(args: argparse.Namespace) -> None:
 def cmd_verify_refs(args: argparse.Namespace) -> None:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    poses = load_reference_poses()
-    dataset = LeRobotDataset(REFS_REPO_ID)
+    poses = load_reference_poses(args.refs_pose_log)
+    dataset = LeRobotDataset(args.refs_repo_id)
     print(f"Loaded {dataset.meta.total_episodes} reference episodes, {len(poses)} logged poses.")
 
     env = SO101PenPickPlaceEnv(control_dt=0.05, randomize_can_pose=False)
@@ -689,11 +814,12 @@ def cmd_verify_refs(args: argparse.Namespace) -> None:
         if ep not in poses:
             print(f"episode {ep}: NO LOGGED POSE -- skipping (can't replay without a known start)")
             continue
-        result = replay_episode(dataset, ep, poses[ep], env)
+        pose = poses[ep]
+        result = replay_episode(dataset, ep, pose["can_xy"], env, fallen=args.fallen, can_heading=pose["can_heading"])
         results.append(result)
         status = "SUCCESS" if result["success"] else "FAIL"
         print(
-            f"episode {ep}: can_xy={poses[ep]} -> {status} "
+            f"episode {ep}: pose={pose} -> {status} "
             f"({result['n_ticks']} ticks replayed)"
         )
 
@@ -706,15 +832,31 @@ def cmd_verify_refs(args: argparse.Namespace) -> None:
     env.close()
 
 
+def _add_refs_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--refs-repo-id", default=REFS_REPO_ID, help="HF dataset repo of the reference demos")
+    p.add_argument("--refs-pose-log", type=Path, default=REFS_POSE_LOG, help="JSON pose log from record_dataset.py --can-xy-log-path")
+    p.add_argument(
+        "--fallen",
+        action="store_true",
+        help="the references are fallen-can recovery demos, not standing-can pick demos: replays/candidates "
+        "spawn with the can fallen, poses carry a heading, and nearest_reference()/generate_candidate() "
+        "retarget with rotation, not just translation (see mimicgen_augment.py's module-level design notes)",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("verify-refs", help="replay all reference episodes and confirm real success")
-    subparsers.add_parser("segment-refs", help="replay + split each reference into approach/transport/place phases")
+    p_verify = subparsers.add_parser("verify-refs", help="replay all reference episodes and confirm real success")
+    _add_refs_args(p_verify)
+    p_seg = subparsers.add_parser("segment-refs", help="replay + split each reference into approach/transport/place phases")
+    _add_refs_args(p_seg)
     p_gen = subparsers.add_parser("generate", help="dry-run (no rendering): generate+verify candidates, report accept rate")
+    _add_refs_args(p_gen)
     p_gen.add_argument("--n-candidates", type=int, default=30)
     p_gen.add_argument("--seed", type=int, default=0)
     p_build = subparsers.add_parser("build-dataset", help="dry-run generate, then re-render + write accepted episodes to a LeRobotDataset")
+    _add_refs_args(p_build)
     p_build.add_argument("--n-candidates", type=int, default=30)
     p_build.add_argument("--seed", type=int, default=0)
     p_build.add_argument("--max-episodes", type=int, default=0, help="stop accepting once this many candidates pass (0 = no cap, use all n-candidates)")

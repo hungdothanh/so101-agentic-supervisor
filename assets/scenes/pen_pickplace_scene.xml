@@ -140,8 +140,28 @@
            (0.0088 -> 0.0066, proportional to r^2 at constant height) to keep
            the same density rather than silently making the can artificially
            denser when it got thinner. -->
+      <!-- condim="6" + a non-default rolling-friction coefficient (3rd friction value):
+           MuJoCo's own default friction is "1 0.005 0.0001" (sliding/torsional/rolling),
+           and condim=3 (also the default) doesn't even activate the torsional/rolling
+           contact dimensions regardless of that value -- fine for a can that only ever
+           rests upright (no rolling involved), but once the can can be fallen (lying on
+           its side, see PLAN.md's supervisor/recovery-policy work), that near-zero
+           rolling friction means ANY rolling motion -- even the tiny, unavoidable
+           settling nudge from teleporting the can into contact via qpos at reset,
+           not just a deliberate shove -- barely decays at all (measured directly:
+           speed plateaus and coasts for 10+ seconds instead of settling), so a fallen
+           can can drift/roll off the table from nothing more than spawn jitter.
+           0.02 is calibrated (not guessed) to reproduce this project's own reference
+           "hard knock" scenario (0.9 m/s + 8 rad/s spin) settling in a bounded ~7cm,
+           matching real-can-on-a-table intuition -- measured empirically by patching
+           geom_friction/geom_condim at runtime across a friction sweep, not derived
+           from a formula (MuJoCo's rolling-friction units aren't a direct real-world
+           coefficient). Verified this doesn't change the default "1 0.005" (sliding/
+           torsional) terms -- an upright can resting on its flat base or being lifted
+           straight up never rolls, so this dimension shouldn't engage during normal
+           standing-can pick-and-place at all. -->
       <geom name="can_collision" type="cylinder" size="0.019 0.038" mass="0.0066" solref="0.005 1"
-            contype="1" conaffinity="1" rgba="0 0 0 0"/>
+            condim="6" friction="1 0.005 0.02" contype="1" conaffinity="1" rgba="0 0 0 0"/>
     </body>
 
     <!-- bin: open-top primitive container (bottom + 4 walls), ~34cm from

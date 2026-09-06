@@ -72,6 +72,8 @@ import os
 import time
 from pathlib import Path
 
+import numpy as np
+
 from lerobot.common.control_utils import sanity_check_dataset_robot_compatibility
 from lerobot.datasets import (
     LeRobotDataset,
@@ -138,6 +140,35 @@ def main() -> None:
         "this script once per position you want a reference at, e.g. --can-xy 0.16 -0.18 for one "
         "corner, then rerun with a different --can-xy for the next.",
     )
+    parser.add_argument(
+        "--fallen",
+        action="store_true",
+        help="record fallen-can recovery demos instead of standing-can pick demos: every reset spawns "
+        "the can lying on its side instead of standing. --can-xy-log-path logs a 3rd value (heading) "
+        "per episode when this is set.",
+    )
+    parser.add_argument(
+        "--can-heading-deg",
+        type=float,
+        default=None,
+        metavar="DEG",
+        help="only meaningful with --fallen: pin every episode's heading to this exact value instead "
+        "of drawing it randomly -- same idea as --can-xy, run once per (position, heading) combo you "
+        "want in the reference grid.",
+    )
+    parser.add_argument(
+        "--roll-impulse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="only meaningful with --fallen: after placing the can fallen, additionally give it a "
+        "randomized knock and settle it via real physics (so101_mujoco.py's reset_scene's own "
+        "roll_impulse) -- PLAN.md's suggested extra realism (a knocked-and-rolled pose instead of an "
+        "idealized in-place tip), NOT required to record usable references. Off by default: it "
+        "requires the scene's can-friction calibration (see PLAN.md/plan notes) to produce a "
+        "realistic ~5-15cm roll rather than an unrealistically long slide -- confirm that's applied "
+        "before turning this on. With it off, --can-heading-deg pins the exact final heading, no "
+        "physics settle step.",
+    )
     parser.add_argument("--mock", action="store_true", help="deterministic sine-sweep teleop, no gamepad required (smoke-test only)")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--push-to-hub", action="store_true")
@@ -176,21 +207,23 @@ def main() -> None:
         "--can-xy-log-path",
         type=Path,
         default=None,
-        help="optional: append each episode's starting can (x, y) to this JSON file as "
-        "{episode_index: [x, y]} after it's saved. The dataset itself has no object-pose "
-        "feature, so without this flag a recorded episode's starting can position is lost "
-        "the moment the next reset overwrites it -- this is for scripts/mimicgen_augment.py, "
-        "which needs known source poses to retarget from. Off by default; a normal "
-        "recording session doesn't need it.",
+        help="optional: append each episode's starting can pose to this JSON file as "
+        "{episode_index: [x, y]} (or {episode_index: [x, y, heading]} with --fallen) after "
+        "it's saved. The dataset itself has no object-pose feature, so without this flag a "
+        "recorded episode's starting can position is lost the moment the next reset "
+        "overwrites it -- this is for scripts/mimicgen_augment.py, which needs known source "
+        "poses to retarget from. Off by default; a normal recording session doesn't need it.",
     )
     args = parser.parse_args()
 
     init_logging()
 
     can_xy_log: dict[int, list[float]] = {}
-    if args.can_xy_log_path and args.can_xy_log_path.exists():
-        with open(args.can_xy_log_path) as f:
-            can_xy_log = {int(k): v for k, v in json.load(f).items()}
+    if args.can_xy_log_path:
+        args.can_xy_log_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.can_xy_log_path.exists():
+            with open(args.can_xy_log_path) as f:
+                can_xy_log = {int(k): v for k, v in json.load(f).items()}
 
     robot = SO101Mujoco(SO101MujocoConfig(id="record", randomize_can_pose_on_connect=args.randomize_can_pose))
     teleop = SO101MujocoTeleop(SO101MujocoTeleopConfig(id="record", mock=args.mock))
@@ -231,12 +264,35 @@ def main() -> None:
             image_writer_threads=4 * num_cameras,
         )
 
+    can_heading_rad = None if args.can_heading_deg is None else float(np.deg2rad(args.can_heading_deg))
+
+    def _fallen_kwargs(pinned_heading: float | None = None, roll: bool | None = None) -> dict:
+        """this session's --fallen settings, as reset_scene() kwargs -- empty dict
+        (today's plain standing-can behavior) unless --fallen is set. `roll` defaults
+        to this session's --roll-impulse setting; passing `roll=False` explicitly
+        (used on retry) pins the exact prior settled pose instead of re-rolling, so a
+        retry reproduces identical conditions rather than a fresh random knock."""
+        if not args.fallen:
+            return {}
+        return {
+            "fallen": True,
+            "can_heading": can_heading_rad if pinned_heading is None else pinned_heading,
+            "roll_impulse": args.roll_impulse if roll is None else roll,
+        }
+
     teleop.connect()
     robot.connect()
-    if args.can_xy is not None:
-        # Override wherever connect()'s own reset just placed the can -- every episode
-        # this session (including episode 0) starts at this exact fixed position.
-        robot.reset_scene(randomize_can_pose=False, can_xy=args.can_xy)
+    if args.can_xy is not None or args.fallen:
+        # Override wherever connect()'s own reset just placed the can. connect() only
+        # ever calls reset_scene(randomize_can_pose=...) internally -- it has no idea
+        # about --fallen -- so without this, episode 0 of a --fallen session would
+        # start with the can STANDING regardless (confirmed the hard way: a real
+        # recording session logged episode 0's heading as exactly 0.0, the value
+        # heading_from_quat() returns for an upright can, while every subsequent
+        # between-episode reset -- which does go through _fallen_kwargs() -- logged a
+        # genuine random heading). --can-xy alone (no --fallen) keeps its original
+        # behavior unchanged.
+        robot.reset_scene(randomize_can_pose=(args.can_xy is None), can_xy=args.can_xy, **_fallen_kwargs())
 
     listener, events = init_keyboard_listener()
     timer = CycleTimer(args.fps)
@@ -246,6 +302,7 @@ def main() -> None:
     # one), and re-applied verbatim on a retry so R / "n" redoes the identical setup
     # instead of drifting to a different pose. See reset_scene()'s docstring.
     current_can_xy = robot.can_xy
+    current_can_heading = robot.can_heading if args.fallen else None
 
     mj_viewer_handle = None
     live_robot_observation_processor = robot_observation_processor
@@ -358,7 +415,11 @@ def main() -> None:
                     # in explicitly is required here: randomize_can_pose=False alone
                     # does NOT preserve the previous pose (mj_resetDataKeyframe always
                     # overwrites the can's qpos first) -- see reset_scene()'s docstring.
-                    robot.reset_scene(randomize_can_pose=False, can_xy=current_can_xy)
+                    robot.reset_scene(
+                        randomize_can_pose=False,
+                        can_xy=current_can_xy,
+                        **_fallen_kwargs(pinned_heading=current_can_heading, roll=False),
+                    )
                     teleop.reset_target()
                     continue
 
@@ -367,9 +428,13 @@ def main() -> None:
                 timer.restart()
 
                 if args.can_xy_log_path:
-                    # current_can_xy still reflects the episode just saved -- the next
-                    # reset (a few lines below) doesn't happen until after this.
-                    can_xy_log[episode_index] = [float(current_can_xy[0]), float(current_can_xy[1])]
+                    # current_can_xy/current_can_heading still reflect the episode just
+                    # saved -- the next reset (a few lines below) doesn't happen until
+                    # after this.
+                    pose = [float(current_can_xy[0]), float(current_can_xy[1])]
+                    if args.fallen:
+                        pose.append(float(current_can_heading))
+                    can_xy_log[episode_index] = pose
                     with open(args.can_xy_log_path, "w") as f:
                         json.dump(can_xy_log, f, indent=2)
 
@@ -379,9 +444,10 @@ def main() -> None:
                     # robot's physics state would leave the teleoperator's own tracked
                     # target stale (see reset_target()'s docstring).
                     if args.can_xy is not None:
-                        current_can_xy = robot.reset_scene(randomize_can_pose=False, can_xy=args.can_xy)
+                        current_can_xy = robot.reset_scene(randomize_can_pose=False, can_xy=args.can_xy, **_fallen_kwargs())
                     else:
-                        current_can_xy = robot.reset_scene(randomize_can_pose=args.randomize_can_pose)
+                        current_can_xy = robot.reset_scene(randomize_can_pose=args.randomize_can_pose, **_fallen_kwargs())
+                    current_can_heading = robot.can_heading if args.fallen else None
                     teleop.reset_target()
                     if args.prep_time_s > 0:
                         log_say("Reset the environment", args.play_sounds)

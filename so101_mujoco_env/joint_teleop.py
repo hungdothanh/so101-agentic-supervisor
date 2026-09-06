@@ -190,7 +190,15 @@ def main() -> None:
     )
     parser.add_argument("--cam-size", type=int, default=480, help="Per-camera render resolution for --cameras")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
+    parser.add_argument(
+        "--fallen",
+        action="store_true",
+        help="spawn (and every reset-button press, respawn) the can lying on its side at a random "
+        "heading instead of standing -- for visually checking the fallen-can spawn/gamepad control "
+        "before an actual scripts/record_dataset.py --fallen recording session.",
+    )
     args = parser.parse_args()
+    reset_options = {"fallen": True} if args.fallen else None
 
     teleop = GamepadJointTeleop(args.config)
     if not teleop.connect():
@@ -218,7 +226,7 @@ def main() -> None:
         return
 
     env = SO101PenPickPlaceEnv(control_dt=dt)
-    env.reset()
+    env.reset(options=reset_options)
 
     import mujoco.viewer
 
@@ -237,7 +245,7 @@ def main() -> None:
             tick_start = time.monotonic()
             action = teleop.get_action()
             if teleop.reset_requested():
-                env.reset()
+                env.reset(options=reset_options)
                 print("Episode reset.")
             else:
                 env.step(action)

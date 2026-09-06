@@ -72,7 +72,34 @@ GRIPPER_RANGE_RAD = (-0.174533, 1.74533)  # matches assets/so101/so101.xml's gri
 CAN_SAMPLING_XY_LOW = np.array([0.16, -0.18])
 CAN_SAMPLING_XY_HIGH = np.array([0.26, -0.02])
 CAN_HALF_HEIGHT = 0.038
+CAN_RADIUS = 0.019  # assets/scenes/pen_pickplace_scene.xml can_collision geom: size="0.019 0.038"
 CAN_UPRIGHT_QUAT = np.array([1.0, 0.0, 0.0, 0.0])
+CAN_ROLL_LINVEL_RANGE = (0.8, 1.2)  # m/s -- see so101_mujoco_env/pen_pickplace_env.py's own calibration note
+CAN_ROLL_SPIN_RANGE = (4.0, 8.0)  # rad/s, random sign
+CAN_ROLL_SETTLE_TIME_S = 6.0
+
+
+def _sample_fallen_quat(rng: np.random.RandomState, heading: float | None = None) -> np.ndarray:
+    """Duplicated from so101_mujoco_env/pen_pickplace_env.py -- see that module's
+    docstring for the full rationale (this package stays self-contained rather than
+    importing from the sibling directory)."""
+    tilt_quat = np.zeros(4)
+    mujoco.mju_euler2Quat(tilt_quat, np.array([np.pi / 2, 0.0, 0.0]), "XYZ")
+    yaw = rng.uniform(-np.pi, np.pi) if heading is None else heading
+    yaw_quat = np.zeros(4)
+    mujoco.mju_euler2Quat(yaw_quat, np.array([0.0, 0.0, yaw]), "XYZ")
+    fallen_quat = np.zeros(4)
+    mujoco.mju_mulQuat(fallen_quat, yaw_quat, tilt_quat)
+    return fallen_quat
+
+
+def _heading_from_quat(quat: np.ndarray) -> float:
+    """Duplicated from so101_mujoco_env/pen_pickplace_env.py's heading_from_quat() --
+    see that module's docstring for the mod-pi rationale."""
+    mat = np.zeros(9)
+    mujoco.mju_quat2Mat(mat, quat)
+    long_axis_world = mat.reshape(3, 3)[:, 2]
+    return float(np.arctan2(long_axis_world[1], long_axis_world[0]) % np.pi)
 
 
 class SO101Mujoco(Robot):
@@ -92,6 +119,7 @@ class SO101Mujoco(Robot):
         self._actuator_id: dict[str, int] = {}
         self._ctrlrange: dict[str, tuple[float, float]] = {}
         self._can_qpos_addr = 0
+        self._can_dof_addr = 0
         self._np_random = np.random.RandomState()
 
         # Not part of the documented Robot ABC -- lerobot_record.py reaches into
@@ -154,6 +182,7 @@ class SO101Mujoco(Robot):
         # pen_pickplace_env.py uses).
         can_joint_id = self.model.body_jntadr[can_body_id]
         self._can_qpos_addr = self.model.jnt_qposadr[can_joint_id]
+        self._can_dof_addr = self.model.jnt_dofadr[can_joint_id]
 
         self.reset_scene(randomize_can_pose=self.config.randomize_can_pose_on_connect)
         self._is_connected = True
@@ -169,6 +198,9 @@ class SO101Mujoco(Robot):
         *,
         randomize_can_pose: bool = True,
         can_xy: np.ndarray | tuple[float, float] | None = None,
+        fallen: bool = False,
+        can_heading: float | None = None,
+        roll_impulse: bool = False,
         seed: int | None = None,
     ) -> np.ndarray:
         """Reset the sim to the scene's 'home' keyframe, then place the can according to
@@ -195,11 +227,22 @@ class SO101Mujoco(Robot):
         Mirrors SO101PenPickPlaceEnv.reset()'s own can-pose sampling exactly (same
         bounds, same axially-symmetric position-only randomization -- see that module's
         docstring for why no orientation randomization is needed for a can).
+
+        `fallen=True` spawns the can lying on its side instead of standing (mirrors
+        SO101PenPickPlaceEnv.reset()'s `options={"fallen": True}` -- see that module's
+        docstring), optionally at an exact `can_heading` instead of a random one.
+        `roll_impulse=True` (requires `fallen=True`) additionally gives the can a
+        randomized knock and settles it via real physics for CAN_ROLL_SETTLE_TIME_S --
+        see so101_mujoco_env/pen_pickplace_env.py's `_apply_roll_impulse_and_settle()`
+        for the identical mechanism and its calibration note.
         """
         if seed is not None:
             self._np_random = np.random.RandomState(seed)
 
         mujoco.mj_resetDataKeyframe(self.model, self.data, self._home_key_id)
+
+        z = CAN_RADIUS if fallen else CAN_HALF_HEIGHT
+        quat = _sample_fallen_quat(self._np_random, heading=can_heading) if fallen else CAN_UPRIGHT_QUAT
 
         if can_xy is not None:
             xy = np.asarray(can_xy, dtype=float)
@@ -210,10 +253,22 @@ class SO101Mujoco(Robot):
 
         if xy is not None:
             addr = self._can_qpos_addr
-            self.data.qpos[addr : addr + 3] = (*xy, CAN_HALF_HEIGHT)
-            self.data.qpos[addr + 3 : addr + 7] = CAN_UPRIGHT_QUAT
+            self.data.qpos[addr : addr + 3] = (*xy, z)
+            self.data.qpos[addr + 3 : addr + 7] = quat
 
         mujoco.mj_forward(self.model, self.data)
+
+        if fallen and roll_impulse:
+            direction = self._np_random.uniform(-np.pi, np.pi)
+            lin_speed = self._np_random.uniform(*CAN_ROLL_LINVEL_RANGE)
+            spin = self._np_random.uniform(*CAN_ROLL_SPIN_RANGE) * self._np_random.choice([-1.0, 1.0])
+            dof = self._can_dof_addr
+            self.data.qvel[dof : dof + 3] = [lin_speed * np.cos(direction), lin_speed * np.sin(direction), 0.0]
+            self.data.qvel[dof + 3 : dof + 6] = [0.0, 0.0, spin]
+            n_settle_steps = int(round(CAN_ROLL_SETTLE_TIME_S / self.model.opt.timestep))
+            for _ in range(n_settle_steps):
+                mujoco.mj_step(self.model, self.data)
+
         return self.data.qpos[self._can_qpos_addr : self._can_qpos_addr + 2].copy()
 
     @property
@@ -222,6 +277,14 @@ class SO101Mujoco(Robot):
         connect()'s own initial reset_scene() call too, not just after one it made
         itself -- see reset_scene()'s docstring for the retry pattern this supports."""
         return self.data.qpos[self._can_qpos_addr : self._can_qpos_addr + 2].copy()
+
+    @property
+    def can_heading(self) -> float:
+        """The can's current heading (see _heading_from_quat()'s mod-pi rationale) --
+        used to log the actual resulting heading after a fallen/roll_impulse reset,
+        mirroring `can_xy`'s retry-capture pattern for position."""
+        addr = self._can_qpos_addr
+        return _heading_from_quat(self.data.qpos[addr + 3 : addr + 7].copy())
 
     @staticmethod
     def _gripper_rad_to_pct(angle_rad: float) -> float:
