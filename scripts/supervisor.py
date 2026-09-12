@@ -42,6 +42,7 @@ from langgraph.graph import END, StateGraph
 from lerobot.common.control_utils import predict_action
 from lerobot.policies.factory import make_pre_post_processors
 from lerobot.policies.smolvla import SmolVLAPolicy
+from lerobot.utils.rerun_visualization import init_rerun, log_rerun_data, shutdown_rerun
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -108,6 +109,23 @@ class SupervisorState(TypedDict):
     status: Literal["running", "success", "can_fallen", "failed"]
     vlm_verdict: str
     recovery_attempts: int
+    # tick value at which the CURRENT attempt began (the initial base-policy run
+    # counts as "attempt 0"; each can_fallen event that is genuinely new -- i.e. the
+    # can wasn't already flagged can_fallen the previous poll -- starts a fresh
+    # attempt and resets this). Per-attempt time budgets are measured relative to
+    # this, not to the episode's absolute tick count.
+    attempt_start_tick: int
+    # True only on the single verify_state call where can_fallen is detected for the
+    # first time since the last non-can_fallen reading (a real new failure event, as
+    # opposed to a later poll simply confirming the same ongoing failure).
+    is_new_fall_event: bool
+    # The raw perceptual label from the PREVIOUS verify_state call (can_standing /
+    # can_fallen / can_in_gripper / success) -- distinct from `status`, which collapses
+    # can_standing and can_in_gripper into the same "running" value. is_new_fall_event
+    # needs this finer-grained history to tell "still fumbling with an already-fallen
+    # can" (last_label stays can_fallen, not a new event) apart from "was genuinely
+    # holding it, then dropped it" (last_label was can_in_gripper -- a real new event).
+    last_label: Literal["can_standing", "can_fallen", "can_in_gripper", "can_off_table", "success"]
 
 
 # ---------------------------------------------------------------------------
@@ -120,15 +138,33 @@ class SupervisorState(TypedDict):
 _CLASSIFY_PROMPT = """You are monitoring a robot arm pick-and-place task in simulation. \
 The task is: "{task}".
 
-Look at the front-camera image and classify the scene into EXACTLY ONE of these three \
+Look at the front-camera image and classify the scene into EXACTLY ONE of these five \
 labels:
 - success: the can is placed inside the bin.
-- can_fallen: the can is lying on its side on the table (not in the bin), regardless of \
-whether the arm is touching it.
-- running: the can is still standing upright on the table and the task is still in \
-progress.
+- can_in_gripper: the gripper's fingers are CLOSED and PINCHED around the can's body, \
+visibly compressing against both sides of it, such that the can would move rigidly \
+with the gripper if the arm moved. Look specifically at the gap between the finger \
+tips and the can's surface: if there is daylight/space between them, or the fingers \
+are open/spread apart, or the gripper is simply positioned above/beside/near the can \
+without touching and clamping it, this is NOT can_in_gripper -- classify the can's own \
+resting state instead (can_fallen or can_standing below). When in doubt, do NOT pick \
+can_in_gripper; only choose it when the grasp is visually unambiguous.
+- can_fallen: the can is lying on its side, resting on the table (not in the bin) and \
+does NOT meet the can_in_gripper bar above -- this includes the arm reaching toward \
+it, touching it, resting against it, or nudging it, as long as the gripper is not \
+visibly clamped around it.
+- can_standing: the can is upright, resting on the table, and does NOT meet the \
+can_in_gripper bar above.
+- can_off_table: the can is not visible anywhere in the image -- not on the table, not \
+in the gripper, not in the bin. It has fallen or rolled off the table/out of the \
+workspace and is unreachable. Only choose this if you're confident the can has \
+genuinely left the scene; if the can might simply be hidden behind the arm or gripper \
+from this camera angle, look for any partial glimpse of its body or color before \
+concluding it's gone, and prefer can_fallen/can_standing/can_in_gripper if there's any \
+doubt.
 
-Respond with exactly one word: success, can_fallen, or running. No other text."""
+Respond with exactly one word: success, can_in_gripper, can_fallen, can_standing, or \
+can_off_table. No other text."""
 
 
 def _image_to_data_url(image: np.ndarray) -> str:
@@ -156,9 +192,11 @@ def _extract_text(content) -> str:
 
 
 def classify_scene(image: np.ndarray, task: str, model: str) -> tuple[str, str]:
-    """Returns (label, raw_response_text). label is one of running/can_fallen/success,
-    defaulting to "running" (the safest fallback -- keeps the base policy going rather
-    than false-triggering a recovery) if the response doesn't parse cleanly."""
+    """Returns (label, raw_response_text). label is one of
+    can_standing/can_fallen/can_in_gripper/can_off_table/success, defaulting to
+    "can_standing" (the safest fallback -- keeps the base policy going, doesn't claim a
+    grasp that may not exist, and doesn't prematurely end the episode) if the response
+    doesn't parse cleanly."""
     llm = ChatOpenAI(model=model, max_completion_tokens=10, temperature=0)
     message = HumanMessage(
         content=[
@@ -169,10 +207,10 @@ def classify_scene(image: np.ndarray, task: str, model: str) -> tuple[str, str]:
     response = llm.invoke([message])
     raw = _extract_text(response.content).strip()
     lowered = raw.lower()
-    for label in ("success", "can_fallen", "running"):
+    for label in ("success", "can_off_table", "can_in_gripper", "can_fallen", "can_standing"):
         if label in lowered:
             return label, raw
-    return "running", raw
+    return "can_standing", raw
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +269,12 @@ def make_execute_policy_node(env: SO101PenPickPlaceEnv, policies: dict, ctx: _Ep
             ctx.last_active_policy = state["active_policy"]
 
         n_action_steps = bundle.policy.config.n_action_steps if bundle is not None else args.n_action_steps_fallback
+        # Each checkpoint is language-conditioned on its OWN training task string --
+        # the base and recovery policies were fine-tuned on different strings ("pick
+        # up the can..." vs "pick up the fallen can..."), so feeding the wrong one to
+        # whichever policy is active would be a real train/eval mismatch, not just a
+        # cosmetic label.
+        task = args.single_task if state["active_policy"] == "base" else args.recovery_single_task
 
         tick = state["tick"]
         for _ in range(n_action_steps):
@@ -249,7 +293,7 @@ def make_execute_policy_node(env: SO101PenPickPlaceEnv, policies: dict, ctx: _Ep
                         bundle.preprocessor,
                         bundle.postprocessor,
                         use_amp=False,
-                        task=args.single_task,
+                        task=task,
                         robot_type="so101_mujoco",
                     )
                 action_deg_pct = action.squeeze(0).cpu().numpy()
@@ -259,7 +303,14 @@ def make_execute_policy_node(env: SO101PenPickPlaceEnv, policies: dict, ctx: _Ep
             ctx.raw_obs, _reward, _terminated, truncated, info = env.step(env_action)
             ctx.truncated = bool(truncated)
             tick += 1
-            if info["succeed"] or truncated or tick >= args.max_steps:
+
+            if args.display_data:
+                log_rerun_data(
+                    observation={"front": ctx.raw_obs["pixels"]["front"], "wrist": ctx.raw_obs["pixels"]["wrist"]},
+                    action={"env_delta": env_action},
+                )
+
+            if info["succeed"] or truncated or tick >= args.max_total_steps:
                 break
 
         return {
@@ -279,44 +330,130 @@ def make_verify_state_node(env: SO101PenPickPlaceEnv, can_dof_addr: int, ctx: _E
         label, raw = classify_fn(state["front_image"], args.single_task, args.vlm_model)
 
         if env._is_success():
-            raw_status = "success"
+            physical_label = "success"
+            still_sliding = False
         elif label == "can_fallen":
+            physical_label = "can_fallen"
             can_linvel = env.data.qvel[can_dof_addr : can_dof_addr + 3]
-            speed = float(np.linalg.norm(can_linvel))
-            if speed > args.can_settle_linvel_threshold:
-                # Can is still visibly rolling/sliding -- defer recovery rather than
-                # burn a grasp attempt on a target that will have moved by the time
-                # the recovery policy's chunk finishes. See PLAN.md's "Can this catch
-                # a can that's still rolling?" section.
-                raw_status = "running"
-            else:
-                raw_status = "can_fallen"
+            still_sliding = float(np.linalg.norm(can_linvel)) > args.can_settle_linvel_threshold
+        elif label == "success":
+            # The VLM itself guessed "success", but the ground-truth check
+            # (env._is_success(), the same simulator-based signal eval_policy.py's
+            # info["succeed"] uses) disagrees. Do NOT trust the VLM's guess here --
+            # a frame where the can is being held directly above/at the bin's rim,
+            # not yet released, is easy to visually mistake for "done", especially
+            # since the classify prompt has no explicit label for that in-between
+            # moment. Fall back to the physically-conservative reading: the can is
+            # still held (if the episode really is finishing, env._is_success() will
+            # correctly flip True on a very soon following tick once it's released).
+            # print(
+            #     f"[verify_state] tick={state['tick']} VLM guessed 'success' but "
+            #     "env._is_success() (ground truth) says False -- overriding to "
+            #     "can_in_gripper, not ending the episode on an unconfirmed guess"
+            # )
+            physical_label = "can_in_gripper"
+            still_sliding = False
         else:
+            physical_label = label  # "can_standing", "can_in_gripper", or "can_off_table"
+            still_sliding = False
+
+        if physical_label == "success":
+            raw_status = "success"
+        elif physical_label == "can_off_table":
+            # Can has left the table/workspace entirely -- nothing the base or recovery
+            # policy does can ever complete the task from here. End immediately rather
+            # than burn the rest of the episode's tick budget on an unreachable goal.
+            raw_status = "failed"
+        elif physical_label == "can_fallen" and not still_sliding:
+            raw_status = "can_fallen"
+        else:
+            # can_standing, can_in_gripper, or a still-sliding can_fallen we're
+            # deliberately not acting on yet -- all just "task in progress" for routing.
+            # See PLAN.md's "Can this catch a can that's still rolling?" section for why
+            # a sliding can_fallen is deferred rather than committed to immediately.
             raw_status = "running"
 
-        if raw_status == "can_fallen" and state["recovery_attempts"] >= args.max_recovery_attempts:
+        # A new fall event is only a can_fallen reading that follows either (a) the
+        # can having genuinely been held (last_label == "can_in_gripper") and now
+        # dropped -- a real, distinct failure -- or (b) this being the very first time
+        # it's happened, while still under base-policy control. Plain "the can is
+        # still lying there, arm hasn't managed to grasp it yet" -- i.e. can_fallen
+        # following can_fallen, or can_fallen following can_standing while ALREADY in
+        # recovery (a VLM flicker mid-grasp-attempt, not a real state change) -- is
+        # explicitly NOT a new event, so it doesn't reset the per-attempt clock or
+        # burn one of --max-recovery-attempts.
+        is_new_fall_event = raw_status == "can_fallen" and (
+            state["active_policy"] == "base" or state["last_label"] == "can_in_gripper"
+        )
+        ticks_this_attempt = state["tick"] - state["attempt_start_tick"]
+
+        if raw_status in ("success", "failed"):
+            # Terminal already (success, or can_off_table above) -- nothing about
+            # attempt/tick bookkeeping can or should override that.
+            status = raw_status
+        elif is_new_fall_event and state["recovery_attempts"] >= args.max_recovery_attempts:
+            # This would be yet another fresh attempt, but we've already used up the
+            # ones we're willing to give it -- the arm keeps failing to hold onto the
+            # can, so stop rather than reset the clock again.
             status = "failed"
-        elif state["tick"] >= args.max_steps:
+        elif not is_new_fall_event and raw_status != "success" and ticks_this_attempt >= args.max_steps_per_attempt:
+            # This SAME attempt (no fresh fall event since it started) has burned its
+            # whole budget without succeeding -- give up rather than let it run forever
+            # on a stall the state machine can't otherwise detect.
+            status = "failed"
+        elif state["tick"] >= args.max_total_steps:
+            # Hard episode-wide safety net, independent of attempt bookkeeping.
             status = "failed"
         else:
             status = raw_status
 
-        return {"status": status, "vlm_verdict": raw}
+        print(
+            f"[verify_state] tick={state['tick']}"
+            + (f" (attempt_tick={ticks_this_attempt})" if is_new_fall_event else "")
+            + f" vlm_label={physical_label!r} -> status={status}"
+            + (" [NEW FALL EVENT]" if is_new_fall_event else "")
+            + (" [CAN OFF TABLE -- unreachable, ending episode]" if physical_label == "can_off_table" else "")
+        )
+        if args.display_data:
+            import rerun as rr
+
+            rr.log("vlm/verdict", rr.TextLog(f"tick={state['tick']} verdict={raw!r} -> status={status}"))
+        return {"status": status, "vlm_verdict": raw, "is_new_fall_event": is_new_fall_event, "last_label": physical_label}
 
     return verify_state
 
 
-def recover(state: SupervisorState) -> dict:
-    stub_note = "" if state["recovery_attempts"] > 0 or state["active_policy"] == "recovery" else " (recovery policy: see --recovery-policy-path)"
-    print(f"[recover] can_fallen detected -- recovery attempt {state['recovery_attempts'] + 1}{stub_note}")
-    return {"recovery_attempts": state["recovery_attempts"] + 1, "active_policy": "recovery"}
+def make_recover_node(args):
+    def recover(state: SupervisorState) -> dict:
+        attempt_num = state["recovery_attempts"] + 1
+        reason = "initial knock-over" if state["active_policy"] == "base" else "dropped after being grasped"
+        print(
+            f"[recover] new can_fallen event ({reason}) -- recovery attempt {attempt_num}; "
+            # f"resetting per-attempt clock (tick={state['tick']} -> fresh {args.max_steps_per_attempt}-tick budget)"
+        )
+        return {
+            "recovery_attempts": attempt_num,
+            "active_policy": "recovery",
+            "attempt_start_tick": state["tick"],
+        }
+
+    return recover
 
 
 def route_after_verify(state: SupervisorState) -> str:
     if state["status"] in ("success", "failed"):
         return "end"
     if state["status"] == "can_fallen":
-        return "recover"
+        # Only detour through `recover` (which bumps recovery_attempts, resets the
+        # per-attempt clock, and does the base->recovery policy switch) on a genuinely
+        # NEW fall event. A later poll that still reads can_fallen because the SAME
+        # attempt hasn't finished yet (SmolVLA's chunk is only n_action_steps=~50
+        # ticks; picking a fallen can up and placing it typically needs several
+        # chunks strung together, same as the base policy would) should just keep
+        # running -- not re-count as a fresh attempt or reset the clock again.
+        if state["is_new_fall_event"]:
+            return "recover"
+        return "execute_policy"
     return "execute_policy"
 
 
@@ -327,7 +464,7 @@ def build_graph(env: SO101PenPickPlaceEnv, policies: dict, ctx: _EpisodeContext,
     g = StateGraph(SupervisorState)
     g.add_node("execute_policy", make_execute_policy_node(env, policies, ctx, args))
     g.add_node("verify_state", make_verify_state_node(env, can_dof_addr, ctx, args, classify_fn))
-    g.add_node("recover", recover)
+    g.add_node("recover", make_recover_node(args))
     g.set_entry_point("execute_policy")
     g.add_edge("execute_policy", "verify_state")
     g.add_conditional_edges(
@@ -335,6 +472,17 @@ def build_graph(env: SO101PenPickPlaceEnv, policies: dict, ctx: _EpisodeContext,
     )
     g.add_edge("recover", "execute_policy")
     return g.compile()
+
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% (default z) Wilson score interval -- same reporting discipline PLAN.md's
+    verification section calls for and this project's README already used for the
+    standing-can baseline/mimicgen comparison, now computed inline rather than by hand."""
+    p_hat = successes / n
+    denom = 1.0 + z**2 / n
+    center = (p_hat + z**2 / (2 * n)) / denom
+    margin = z * np.sqrt(p_hat * (1 - p_hat) / n + z**2 / (4 * n**2)) / denom
+    return max(0.0, center - margin), min(1.0, center + margin)
 
 
 def initial_state() -> SupervisorState:
@@ -346,6 +494,9 @@ def initial_state() -> SupervisorState:
         "status": "running",
         "vlm_verdict": "",
         "recovery_attempts": 0,
+        "attempt_start_tick": 0,
+        "is_new_fall_event": False,
+        "last_label": "can_standing",
     }
 
 
@@ -354,10 +505,44 @@ def main() -> None:
     parser.add_argument("--base-policy-path", required=True)
     parser.add_argument("--recovery-policy-path", default=None, help="omit to run the stub (holds position) recover behavior")
     parser.add_argument("--num-episodes", type=int, default=5)
-    parser.add_argument("--single-task", required=True)
+    parser.add_argument("--single-task", required=True, help="task string the BASE checkpoint was fine-tuned on")
+    parser.add_argument(
+        "--recovery-single-task",
+        default=None,
+        help="task string the RECOVERY checkpoint was fine-tuned on (e.g. 'pick up the fallen can and place "
+        "it in the bin') -- defaults to --single-task if omitted (fine for the stub recover behavior, wrong "
+        "for a real recovery checkpoint trained on a different task string)",
+    )
     parser.add_argument("--control-dt", type=float, default=0.05, help="must match the recording rate the checkpoint(s) were trained at")
-    parser.add_argument("--max-steps", type=int, default=600, help="per-episode control-tick cap, same concept as eval_policy.py's own")
-    parser.add_argument("--max-recovery-attempts", type=int, default=3, help="guards against an infinite recover<->fail loop")
+    parser.add_argument(
+        "--max-steps-per-attempt",
+        type=int,
+        default=600,
+        help="tick budget given to EACH attempt (the initial base-policy run, and each "
+        "fresh recovery attempt after a can_fallen event) -- same concept as "
+        "eval_policy.py's own --max-steps, but reset every time a genuinely NEW "
+        "can_fallen event fires rather than shared across the whole episode. 600 "
+        "comfortably covers a single ~300-500-tick pick-and-place (see README).",
+    )
+    parser.add_argument(
+        "--max-total-steps",
+        type=int,
+        default=None,
+        help="hard episode-wide tick ceiling, independent of attempt bookkeeping -- purely "
+        "a safety net against a runaway episode (e.g. the state machine oscillating "
+        "can_fallen<->running without ever resolving). Defaults to "
+        "--max-steps-per-attempt * (--max-recovery-attempts + 1) if not given.",
+    )
+    parser.add_argument(
+        "--max-recovery-attempts",
+        type=int,
+        default=3,
+        help="guards against an infinite recover<->fail loop. Counts DISTINCT recovery "
+        "episodes (i.e. a genuinely NEW can_fallen event: the initial base->fallen "
+        "transition, or a re-fall after the can was airborne/being carried), not "
+        "individual VLM polls/chunks -- each such event resets the per-attempt clock "
+        "(--max-steps-per-attempt) so the recovery policy gets a fresh full budget.",
+    )
     parser.add_argument(
         "--can-settle-linvel-threshold",
         type=float,
@@ -371,7 +556,19 @@ def main() -> None:
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--force-fallen-spawn", action=argparse.BooleanOptionalAction, default=False, help="spawn the can already fallen every episode, to exercise the recovery path on demand")
     parser.add_argument("--graph-recursion-limit", type=int, default=500)
+    parser.add_argument(
+        "--display-data",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="stream camera feeds + action + VLM verdict to a live Rerun viewer window (requires "
+        "rerun-sdk, same tool record_dataset.py's --display-data references) -- opens its own window, "
+        "separate from this terminal's output",
+    )
     args = parser.parse_args()
+    if args.recovery_single_task is None:
+        args.recovery_single_task = args.single_task
+    if args.max_total_steps is None:
+        args.max_total_steps = args.max_steps_per_attempt * (args.max_recovery_attempts + 1)
 
     device = torch.device(args.device)
     policies = {
@@ -382,6 +579,9 @@ def main() -> None:
     env = SO101PenPickPlaceEnv(image_obs=True, randomize_can_pose=True, render_size=(480, 480), control_dt=args.control_dt)
     ctx = _EpisodeContext()
     graph = build_graph(env, policies, ctx, args)
+
+    if args.display_data:
+        init_rerun(session_name="so101_supervisor")
 
     successes = 0
     results = []
@@ -403,15 +603,20 @@ def main() -> None:
             successes += int(success)
             results.append(success)
             print(
-                f"episode {episode + 1}/{args.num_episodes}: {'SUCCESS' if success else 'fail'} "
-                f"(status={result['status']}, tick={result['tick']}, recovery_attempts={result['recovery_attempts']})"
+                f"EPISODE {episode + 1}/{args.num_episodes}: {'SUCCESS' if success else 'fail'} "
+                f"(status={result['status']}, tick={result['tick']}, recovery_attempts={result['recovery_attempts']}) \n"
             )
     finally:
         env.close()
+        if args.display_data:
+            shutdown_rerun()
 
     n_run = len(results)
     rate = successes / n_run if n_run else 0.0
     print(f"\nSuccess rate: {successes}/{n_run} = {rate:.1%}")
+    if n_run:
+        lo, hi = wilson_ci(successes, n_run)
+        print(f"95% CI (Wilson): [{lo:.1%}, {hi:.1%}]")
 
 
 if __name__ == "__main__":

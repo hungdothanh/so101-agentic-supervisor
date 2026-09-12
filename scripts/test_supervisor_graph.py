@@ -54,6 +54,8 @@ def make_scripted_classifier(labels: list[str]):
 def make_args(**overrides) -> SimpleNamespace:
     defaults = dict(
         single_task="pick up the can and place it in the bin",
+        recovery_single_task="pick up the fallen can and place it in the bin",
+        display_data=False,
         max_steps=30,
         max_recovery_attempts=3,
         can_settle_linvel_threshold=0.03,
