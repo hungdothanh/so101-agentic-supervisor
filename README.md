@@ -70,6 +70,7 @@ are `lerobot/smolvla_base` fine-tuned with identical hyperparameters (20k steps,
 
 
 **Reproduce:**
+
 Evaluate the baseline and mimic policy without supervisor (swap `--policy-path` for the baseline)
 ```bash
 python scripts/eval_policy.py \
