@@ -1,6 +1,6 @@
 # SO-101 Agentic VLA: Hierarchical VLM-Guided Failure Detection and Policy Recovery
 
-This project builds an agentic supervised framework for a pick-place task driven by a LangGraph supervisor that detects, via a VLM, when the arm accidentally knocks the can over mid-grasp (an out-of-distribution state the base policy was never trained to recover from) and routes to a dedicated recovery policy fine-tuned specifically for picking up a fallen can. See [`PLAN.md`](PLAN.md) for the full design. 
+This project builds an agentic supervised framework for a pick-place task driven by a LangGraph supervisor that detects, via a VLM, when the arm accidentally knocks the can over mid-grasp (an out-of-distribution state the base policy was never trained to recover from) and routes to a dedicated recovery policy fine-tuned specifically for picking up a fallen can.  
 The simulation is developed with MuJuCo for the SO-101 arm, gamepad teleop, and a LeRobot `Robot`/`Teleoperator` bridge for recording pick-and-place datasets and fine-tuning SmolVLA
 
 ![Agentic supervisor workflow](docs/agentic_supervisor_workflow.png)
@@ -157,7 +157,6 @@ print('OK: both registered')
 - `MUJOCO_GL=osmesa` or `egl` -- if offscreen camera rendering fails (e.g. headless server).
 - Gamepad mapping: `so101_mujoco_env/config/gamepad.config.yaml` (PS4/PS5 profile verified;   adjust for other pads).
 
-Full explanations: see [`PLAN.md`](PLAN.md#setup--environment-notes).
 
 ## Usage
 
