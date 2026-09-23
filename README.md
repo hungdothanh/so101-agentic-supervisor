@@ -3,7 +3,14 @@
 This project builds an agentic supervised framework for a pick-place task driven by a LangGraph supervisor that detects, via a VLM, when the arm accidentally knocks the can over mid-grasp (an out-of-distribution state the base policy was never trained to recover from) and routes to a dedicated recovery policy fine-tuned specifically for picking up a fallen can.  
 The simulation is developed with MuJuCo for the SO-101 arm, gamepad teleop, and a LeRobot `Robot`/`Teleoperator` bridge for recording pick-and-place datasets and fine-tuning SmolVLA
 
-![Agentic supervisor workflow](docs/agentic_supervisor_workflow.png)
+<p align="center">
+  <img src="docs/agentic_supervisor_workflow.png"
+       alt="LangGraph-based agentic supervisor workflow">
+</p>
+
+<p align="center">
+  <em>Figure 1. LangGraph-based supervisor that executes SmolVLA in action chunks, verifies task state with a VLM, and switches to a recovery policy when the can falls before returning to policy execution.</em>
+</p>
 
 ## Recorded dataset
 
@@ -12,7 +19,7 @@ The simulation is developed with MuJuCo for the SO-101 arm, gamepad teleop, and 
 </p>
 
 <p align="center">
-  <em>Figure 1. Episode 49 from the <a href="https://huggingface.co/datasets/hungdo2401/so101_baseline"><code>hungdo2401/so101_baseline</code></a> dataset, showing the front camera (left) and wrist camera (right).</em>
+  <em>Figure 2. Episode 49 from the <a href="https://huggingface.co/datasets/hungdo2401/so101_baseline"><code>hungdo2401/so101_baseline</code></a> dataset, showing the front camera (left) and wrist camera (right).</em>
 </p>
 
 <p align="center">
@@ -20,7 +27,7 @@ The simulation is developed with MuJuCo for the SO-101 arm, gamepad teleop, and 
 </p>
 
 <p align="center">
-  <em>Figure 2. Commanded <code>action</code> and observed <code>observation.state</code> for each joint over time.</em>
+  <em>Figure 3. Commanded <code>action</code> and observed <code>observation.state</code> for each joint over time.</em>
 </p>
 
 A pick-and-place dataset (can into bin, gamepad-teleoperated, per-episode-pose-randomized) is already recorded and pushed to the Hub, along with a MimicGen-augmented dataset built on top of it (segment-and-retarget MimicGen from human reference demos):
@@ -44,7 +51,7 @@ are `lerobot/smolvla_base` fine-tuned with identical hyperparameters (20k steps,
 |---|---|---|
 | Unaugmented Baseline (`baseline`) | 60/100 = 60.0% | [50.2%, 69.1%] |
 | Augmented Baseline Without Recovery (`baseline_plus_mimicgen`) | 73/100 = 73.0% | [63.6%, 80.7%] |
-| Agentic Supervisor (`baseline_plus_mimicgen` + `fallen_plus_mimicgen`) | 81/100 = 81.0% | [72.2%, 87.5%] |
+| **Our proposed framework - Agentic Supervisor** (`baseline_plus_mimicgen` + `fallen_plus_mimicgen`) | 81/100 = 81.0% | [72.2%, 87.5%] |
 
 
 **Failure Types:**
