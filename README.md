@@ -7,12 +7,21 @@ The simulation is developed with MuJuCo for the SO-101 arm, gamepad teleop, and 
 
 ## Recorded dataset
 
-![Episode 49: front view (left) and wrist view (right)](docs/episode_49_demo.gif)
-*Episode 49 of [`hungdo2401/so101_baseline`](https://huggingface.co/datasets/hungdo2401/so101_baseline)
--- front camera (left) and wrist camera (right).*
+<p align="center">
+  <img src="docs/episode_49_demo.gif" alt="Episode 49: front view and wrist view">
+</p>
 
-![Episode 49: commanded action vs. observed state, per joint](docs/episode_49_action_state.png)
-*-- `action`/`observation.state`, per joint, over time.*
+<p align="center">
+  <em>Figure 1. Episode 49 from the <a href="https://huggingface.co/datasets/hungdo2401/so101_baseline"><code>hungdo2401/so101_baseline</code></a> dataset, showing the front camera (left) and wrist camera (right).</em>
+</p>
+
+<p align="center">
+  <img src="docs/episode_49_action_state.png" alt="Episode 49: commanded action vs. observed state per joint">
+</p>
+
+<p align="center">
+  <em>Figure 2. Commanded <code>action</code> and observed <code>observation.state</code> for each joint over time.</em>
+</p>
 
 A pick-and-place dataset (can into bin, gamepad-teleoperated, per-episode-pose-randomized) is already recorded and pushed to the Hub, along with a MimicGen-augmented dataset built on top of it (segment-and-retarget MimicGen from human reference demos):
 
